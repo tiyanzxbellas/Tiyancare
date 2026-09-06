@@ -183,6 +183,42 @@ export const chaptersFromManga = (detail: AnyRecord | null): ChapterItem[] => {
 };
 
 /**
+ * Numeric position of a chapter in the series ("1", "1.5", "Chapter 12" →
+ * 12 / 1.5). Returns `null` when no number can be extracted.
+ */
+export const parseChapterNumber = (chapter: Pick<ChapterItem, 'number'>): number | null => {
+  if (chapter.number === undefined || chapter.number === null) return null;
+  const match = String(chapter.number).trim().match(/\d+(?:\.\d+)?/);
+  if (!match) return null;
+  const value = Number(match[0]);
+  return Number.isFinite(value) ? value : null;
+};
+
+/**
+ * Orders chapters by reading sequence (chapter 1 first), regardless of the
+ * order upstream returns them in. DoujinDesu is observed to serve the list
+ * newest-first, which previously inverted the reader's "Sebelumnya" /
+ * "Selanjutnya" buttons — navigation must never depend on the array order.
+ *
+ * Chapters without a parseable number fall back to their publish date, then
+ * to their position in the original list.
+ */
+export const sortChaptersForReading = (chapters: ChapterItem[]): ChapterItem[] => {
+  return chapters
+    .map((chapter, index) => ({ chapter, index }))
+    .sort((a, b) => {
+      const numA = parseChapterNumber(a.chapter);
+      const numB = parseChapterNumber(b.chapter);
+      if (numA !== null && numB !== null && numA !== numB) return numA - numB;
+      const dateA = a.chapter.date ? Date.parse(a.chapter.date) : Number.NaN;
+      const dateB = b.chapter.date ? Date.parse(b.chapter.date) : Number.NaN;
+      if (Number.isFinite(dateA) && Number.isFinite(dateB) && dateA !== dateB) return dateA - dateB;
+      return a.index - b.index;
+    })
+    .map((entry) => entry.chapter);
+};
+
+/**
  * Pulls the page image URLs out of a chapter payload. Pages have appeared as
  * plain string arrays, as objects with an `url`/`image` field, and nested under
  * `content_urls` (the current API) / `images` / `pages` / `content`.

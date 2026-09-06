@@ -1,4 +1,4 @@
-import React, { useCallback, useEffect, useMemo, useState } from 'react';
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   AlertCircle,
   ArrowLeft,
@@ -6,6 +6,7 @@ import {
   ChevronLeft,
   ChevronRight,
   ExternalLink,
+  History,
   Layers,
   RefreshCw,
   Star,
@@ -19,10 +20,17 @@ import {
   normalizeManga,
   objectFromResponse,
   pagesFromChapter,
+  sortChaptersForReading,
   type AnyRecord,
   type ChapterItem,
   type MangaItem,
 } from '../utils/doujin';
+import {
+  findProgressChapter,
+  getReadingProgress,
+  saveReadingProgress,
+  type ReadingProgressEntry,
+} from '../utils/readingProgress';
 
 interface DoujinReaderProps {
   /** Slug (preferred) or id of the title to open. */
@@ -57,6 +65,30 @@ export const DoujinReader: React.FC<DoujinReaderProps> = ({ mangaKey, preview, o
   const [loadingPages, setLoadingPages] = useState(false);
   const [pagesError, setPagesError] = useState<string | null>(null);
 
+  // ------------------------------------------------------------- Reading memory
+  /** True once this mount auto-opened the last-read chapter (run once per title). */
+  const [resumed, setResumed] = useState(false);
+  /** Page index the reader should scroll to once its images are mounted. */
+  const restorePageRef = useRef<number | null>(null);
+  /** Which page index is currently on screen (0-based). */
+  const currentPageRef = useRef(0);
+  const pagesContainerRef = useRef<HTMLDivElement | null>(null);
+
+  /**
+   * Chapters in reading order (oldest → newest), independent of the order the
+   * API returns. Prev/Next navigation uses THIS list — the upstream order is
+   * newest-first, which is what inverted the buttons before.
+   */
+  const chaptersForReading = useMemo(() => sortChaptersForReading(chapters), [chapters]);
+
+  // Refreshed whenever the view switches (list ↔ chapter) so the "Lanjut
+  // baca" banner and the last-read badge always reflect the stored progress.
+  const savedProgress: ReadingProgressEntry | null = useMemo(
+    () => getReadingProgress(mangaKey),
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [mangaKey, activeChapter]
+  );
+
   const loadDetail = useCallback(async () => {
     if (!mangaKey) return;
     setLoading(true);
@@ -87,41 +119,153 @@ export const DoujinReader: React.FC<DoujinReaderProps> = ({ mangaKey, preview, o
   useEffect(() => {
     setActiveChapter(null);
     setPages([]);
+    setResumed(false);
+    restorePageRef.current = null;
+    currentPageRef.current = 0;
     loadDetail();
   }, [loadDetail]);
 
-  const openChapter = useCallback(async (chapter: ChapterItem) => {
-    if (!chapter.id) {
-      setPagesError('Chapter ini tidak punya ID yang bisa dibuka.');
+  const openChapter = useCallback(
+    async (chapter: ChapterItem, resumePage = 0) => {
+      if (!chapter.id) {
+        setPagesError('Chapter ini tidak punya ID yang bisa dibuka.');
+        setActiveChapter(chapter);
+        setPages([]);
+        restorePageRef.current = null;
+        currentPageRef.current = 0;
+        return;
+      }
       setActiveChapter(chapter);
       setPages([]);
-      return;
-    }
-    setActiveChapter(chapter);
-    setPages([]);
-    setPagesError(null);
-    setLoadingPages(true);
-    try {
-      const raw = await doujindesuApi.public.getChapter(chapter.id);
-      const detail = objectFromResponse(raw);
-      const imageUrls = pagesFromChapter(detail);
-      setPages(imageUrls);
-      if (!imageUrls.length) {
-        setPagesError('Halaman chapter tidak tersedia (mungkin butuh login atau VIP).');
+      setPagesError(null);
+      setLoadingPages(true);
+      restorePageRef.current = null;
+      currentPageRef.current = 0;
+      try {
+        const raw = await doujindesuApi.public.getChapter(chapter.id);
+        const detail = objectFromResponse(raw);
+        const imageUrls = pagesFromChapter(detail);
+        setPages(imageUrls);
+        if (!imageUrls.length) {
+          setPagesError('Halaman chapter tidak tersedia (mungkin butuh login atau VIP).');
+        } else {
+          const startPage = Math.min(Math.max(resumePage, 0), imageUrls.length - 1);
+          currentPageRef.current = startPage;
+          if (startPage > 0) restorePageRef.current = startPage;
+          // Reading memory: remember this chapter (and page) as last-read.
+          saveReadingProgress({
+            mangaKey,
+            mangaTitle: manga?.title,
+            chapterId: chapter.id,
+            chapterNumber: chapter.number,
+            chapterLabel: chapterLabel(chapter),
+            page: startPage,
+            pageCount: imageUrls.length,
+          });
+        }
+        // Fire-and-forget view counter; failures must not break the reader.
+        doujindesuApi.interactions.viewChapter(chapter.id).catch(() => undefined);
+      } catch (err: any) {
+        setPagesError(err?.message || 'Gagal memuat halaman chapter.');
+      } finally {
+        setLoadingPages(false);
       }
-      // Fire-and-forget view counter; failures must not break the reader.
-      doujindesuApi.interactions.viewChapter(chapter.id).catch(() => undefined);
-    } catch (err: any) {
-      setPagesError(err?.message || 'Gagal memuat halaman chapter.');
-    } finally {
-      setLoadingPages(false);
+      window.scrollTo({ top: 0, behavior: 'smooth' });
+    },
+    [mangaKey, manga?.title]
+  );
+
+  // Reading memory: as soon as the chapter list is available, open the
+  // chapter the user last read so they continue exactly where they left off.
+  // Runs once per mount — a manual "Daftar Chapter" back-button must not
+  // be bounced straight back into the chapter.
+  useEffect(() => {
+    if (resumed || loading || chapters.length === 0 || activeChapter) return;
+    setResumed(true);
+    const entry = getReadingProgress(mangaKey);
+    const chapter = findProgressChapter(chapters, entry);
+    if (chapter) {
+      openChapter(chapter, entry?.page ?? 0);
     }
-    window.scrollTo({ top: 0, behavior: 'smooth' });
+  }, [resumed, loading, chapters, activeChapter, mangaKey, openChapter]);
+
+  // Reading memory (part 2): track which page is on screen while reading and
+  // persist it — throttled during scrolling, immediately when the tab is
+  // hidden or closed — so the position survives refreshes and app exits.
+  useEffect(() => {
+    if (!activeChapter) return;
+
+    let lastWrite = 0;
+    const persist = (immediate: boolean) => {
+      const now = Date.now();
+      if (!immediate && now - lastWrite < 1500) return;
+      lastWrite = now;
+      saveReadingProgress({
+        mangaKey,
+        mangaTitle: manga?.title,
+        chapterId: activeChapter.id,
+        chapterNumber: activeChapter.number,
+        chapterLabel: chapterLabel(activeChapter),
+        page: currentPageRef.current,
+        pageCount: pages.length || undefined,
+      });
+    };
+
+    const onScroll = () => {
+      const container = pagesContainerRef.current;
+      if (!container) return;
+      const marker = window.scrollY + window.innerHeight * 0.35;
+      let idx = currentPageRef.current;
+      container.querySelectorAll('img').forEach((img, i) => {
+        const top = img.getBoundingClientRect().top + window.scrollY;
+        if (top <= marker) idx = i;
+      });
+      if (idx !== currentPageRef.current) {
+        currentPageRef.current = idx;
+        persist(false);
+      }
+    };
+
+    const persistNow = () => persist(true);
+    const onVisibilityChange = () => {
+      if (document.visibilityState === 'hidden') persist(true);
+    };
+
+    window.addEventListener('scroll', onScroll, { passive: true });
+    window.addEventListener('pagehide', persistNow);
+    document.addEventListener('visibilitychange', onVisibilityChange);
+    return () => {
+      window.removeEventListener('scroll', onScroll);
+      window.removeEventListener('pagehide', persistNow);
+      document.removeEventListener('visibilitychange', onVisibilityChange);
+    };
+  }, [activeChapter, mangaKey, manga?.title, pages.length]);
+
+  /** Scrolls the reader to the remembered page once its image is mounted. */
+  const handlePageImgRef = useCallback((el: HTMLImageElement | null, idx: number) => {
+    if (!el || restorePageRef.current === null || idx !== restorePageRef.current) return;
+    const scrollTo = () => {
+      if (restorePageRef.current !== idx) return;
+      restorePageRef.current = null;
+      el.scrollIntoView({ block: 'center' });
+    };
+    if (el.complete && el.naturalHeight > 0) {
+      requestAnimationFrame(scrollTo);
+    } else {
+      el.addEventListener('load', scrollTo, { once: true });
+      el.addEventListener('error', scrollTo, { once: true });
+    }
   }, []);
 
   const activeIndex = useMemo(
-    () => chapters.findIndex((c) => c.id === activeChapter?.id),
-    [chapters, activeChapter]
+    () => chaptersForReading.findIndex((c) => c.id === activeChapter?.id),
+    [chaptersForReading, activeChapter]
+  );
+
+  /** The chapter the stored progress points to, if it still exists. */
+  const lastReadChapter = useMemo(
+    () => findProgressChapter(chapters, savedProgress),
+    [chapters, savedProgress]
   );
 
   const externalUrl = manga ? mangaSiteUrl(manga, DOUJINDESU_SITE_URL) : null;
@@ -165,10 +309,11 @@ export const DoujinReader: React.FC<DoujinReaderProps> = ({ mangaKey, preview, o
             </button>
           </div>
         ) : (
-          <div className="flex flex-col items-center gap-1 bg-dark-950">
+          <div ref={pagesContainerRef} className="flex flex-col items-center gap-1 bg-dark-950">
             {pages.map((url, idx) => (
               <img
                 key={`${url}-${idx}`}
+                ref={(el) => handlePageImgRef(el, idx)}
                 src={pageImageSrc(url)}
                 alt={`Halaman ${idx + 1}`}
                 loading={idx < 2 ? 'eager' : 'lazy'}
@@ -179,21 +324,43 @@ export const DoujinReader: React.FC<DoujinReaderProps> = ({ mangaKey, preview, o
           </div>
         )}
 
-        {chapters.length > 1 && (
+        {chaptersForReading.length > 1 && (
           <div className="flex items-center justify-center gap-3 pt-4 border-t border-slate-800">
             <button
               disabled={activeIndex <= 0}
-              onClick={() => openChapter(chapters[activeIndex - 1])}
-              className="inline-flex items-center gap-2 px-4 py-2.5 rounded-xl bg-dark-900 border border-slate-800 text-xs font-bold text-slate-300 disabled:opacity-40"
+              onClick={() => {
+                if (activeIndex > 0) openChapter(chaptersForReading[activeIndex - 1]);
+              }}
+              className="inline-flex items-center gap-2 px-4 py-2 rounded-xl bg-dark-900 border border-slate-800 text-xs font-bold text-slate-300 disabled:opacity-40"
             >
-              <ChevronLeft className="w-4 h-4" /> Sebelumnya
+              <ChevronLeft className="w-4 h-4" />
+              <span className="flex flex-col items-start leading-tight">
+                Sebelumnya
+                <span className="text-[10px] font-semibold text-slate-500">
+                  {activeIndex > 0
+                    ? chapterLabel(chaptersForReading[activeIndex - 1], activeIndex - 1)
+                    : 'Awal'}
+                </span>
+              </span>
             </button>
             <button
-              disabled={activeIndex < 0 || activeIndex >= chapters.length - 1}
-              onClick={() => openChapter(chapters[activeIndex + 1])}
-              className="inline-flex items-center gap-2 px-4 py-2.5 rounded-xl bg-gradient-to-r from-brand-rose to-brand-pink text-white text-xs font-bold disabled:opacity-40"
+              disabled={activeIndex < 0 || activeIndex >= chaptersForReading.length - 1}
+              onClick={() => {
+                if (activeIndex >= 0 && activeIndex < chaptersForReading.length - 1) {
+                  openChapter(chaptersForReading[activeIndex + 1]);
+                }
+              }}
+              className="inline-flex items-center gap-2 px-4 py-2 rounded-xl bg-gradient-to-r from-brand-rose to-brand-pink text-white text-xs font-bold disabled:opacity-40"
             >
-              Selanjutnya <ChevronRight className="w-4 h-4" />
+              <span className="flex flex-col items-start leading-tight">
+                Selanjutnya
+                <span className="text-[10px] font-semibold text-white/70">
+                  {activeIndex >= 0 && activeIndex < chaptersForReading.length - 1
+                    ? chapterLabel(chaptersForReading[activeIndex + 1], activeIndex + 1)
+                    : 'Chapter terakhir'}
+                </span>
+              </span>
+              <ChevronRight className="w-4 h-4" />
             </button>
           </div>
         )}
@@ -261,6 +428,34 @@ export const DoujinReader: React.FC<DoujinReaderProps> = ({ mangaKey, preview, o
         </div>
       </div>
 
+      {/* Reading memory: jump straight back to the last-read chapter */}
+      {savedProgress && !loading && !error && lastReadChapter && (
+        <button
+          onClick={() => openChapter(lastReadChapter, savedProgress.page ?? 0)}
+          className="w-full flex items-center gap-3 px-4 py-3.5 rounded-2xl bg-gradient-to-r from-brand-rose/15 via-brand-pink/10 to-dark-900 border border-brand-rose/40 hover:border-brand-rose/70 transition-all text-left"
+        >
+          <div className="w-10 h-10 rounded-xl bg-brand-rose/20 border border-brand-rose/30 flex items-center justify-center shrink-0">
+            <History className="w-5 h-5 text-brand-rose" />
+          </div>
+          <div className="flex-1 min-w-0">
+            <p className="text-xs font-extrabold text-white truncate">
+              Lanjut baca: {savedProgress.chapterLabel || chapterLabel(lastReadChapter)}
+            </p>
+            <p className="text-[10px] text-slate-400 mt-0.5 truncate">
+              Halaman {(savedProgress.page ?? 0) + 1}
+              {typeof savedProgress.pageCount === 'number' ? ` dari ${savedProgress.pageCount}` : ''}
+              {typeof savedProgress.updatedAt === 'number'
+                ? ` · terakhir dibaca ${new Date(savedProgress.updatedAt).toLocaleDateString('id-ID', {
+                    day: 'numeric',
+                    month: 'short',
+                  })}`
+                : ''}
+            </p>
+          </div>
+          <ChevronRight className="w-4 h-4 text-brand-rose shrink-0" />
+        </button>
+      )}
+
       <section className="space-y-3">
         <div className="flex items-center gap-2">
           <Layers className="w-4 h-4 text-brand-pink" />
@@ -292,21 +487,35 @@ export const DoujinReader: React.FC<DoujinReaderProps> = ({ mangaKey, preview, o
           </div>
         ) : (
           <div className="grid gap-2">
-            {chapters.map((chapter, idx) => (
-              <button
-                key={chapter.id || idx}
-                onClick={() => openChapter(chapter)}
-                className="flex items-center justify-between gap-3 px-4 py-3 rounded-xl bg-dark-900 border border-slate-800 hover:border-brand-rose/60 text-left transition-all"
-              >
-                <span className="text-xs font-semibold text-slate-100 truncate">
-                  {chapterLabel(chapter, idx)}
-                </span>
-                <span className="flex items-center gap-2 shrink-0">
-                  {chapter.date && <span className="text-[10px] text-slate-500">{chapter.date.slice(0, 10)}</span>}
-                  <ChevronRight className="w-4 h-4 text-slate-500" />
-                </span>
-              </button>
-            ))}
+            {chapters.map((chapter, idx) => {
+              const isLastRead = Boolean(savedProgress?.chapterId && chapter.id === savedProgress.chapterId);
+              return (
+                <button
+                  key={chapter.id || idx}
+                  onClick={() => openChapter(chapter)}
+                  className={`flex items-center justify-between gap-3 px-4 py-3 rounded-xl border text-left transition-all ${
+                    isLastRead
+                      ? 'bg-brand-rose/10 border-brand-rose/50 hover:border-brand-rose/70'
+                      : 'bg-dark-900 border-slate-800 hover:border-brand-rose/60'
+                  }`}
+                >
+                  <span className="flex items-center gap-2 min-w-0">
+                    <span className="text-xs font-semibold text-slate-100 truncate">
+                      {chapterLabel(chapter, idx)}
+                    </span>
+                    {isLastRead && (
+                      <span className="shrink-0 px-1.5 py-0.5 rounded-md bg-brand-rose/20 text-brand-rose text-[9px] font-bold uppercase tracking-wide">
+                        Terakhir dibaca
+                      </span>
+                    )}
+                  </span>
+                  <span className="flex items-center gap-2 shrink-0">
+                    {chapter.date && <span className="text-[10px] text-slate-500">{chapter.date.slice(0, 10)}</span>}
+                    <ChevronRight className="w-4 h-4 text-slate-500" />
+                  </span>
+                </button>
+              );
+            })}
           </div>
         )}
       </section>
